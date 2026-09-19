@@ -74,7 +74,7 @@ const config = {
   autoRequest: bool(process.env.AUTO_REQUEST_ON_JOIN),
   // Música de espera
   musicEnabled: bool(process.env.WAITING_MUSIC_ENABLED),
-  musicPath: process.env.WAITING_MUSIC_PATH || path.join(__dirname, '..', 'assets', 'espera.mp3'),
+  musicPath: process.env.WAITING_MUSIC_PATH || path.join(__dirname, '..', 'musica_espera.mp3'),
   musicVolume: Math.min(Math.max(Number(process.env.WAITING_MUSIC_VOLUME || 0.25), 0), 1),
   musicSelfDeaf: bool(process.env.WAITING_MUSIC_SELF_DEAF),
 };
@@ -101,6 +101,8 @@ const EPHEMERAL = { flags: MessageFlags.Ephemeral };
 
 let audioPlayer = null;
 let musicAvailable = config.musicEnabled;
+let voiceRetryTimer = null;
+const VOICE_RETRY_MS = 15000;
 
 function buildResource() {
   const resource = createAudioResource(fs.createReadStream(config.musicPath), {
@@ -176,9 +178,12 @@ async function startWaitingMusic(waitingChannel) {
     } catch (error) {
       console.error('No pude conectarme al canal de espera:', error.message);
       connection.destroy();
+      scheduleVoiceRetry(waitingChannel);
       return;
     }
   }
+
+  clearVoiceRetry();
 
   const player = getPlayer();
   connection.subscribe(player);
@@ -188,7 +193,30 @@ async function startWaitingMusic(waitingChannel) {
   }
 }
 
+function clearVoiceRetry() {
+  if (voiceRetryTimer) {
+    clearTimeout(voiceRetryTimer);
+    voiceRetryTimer = null;
+  }
+}
+
+// Reintenta la conexión de voz cada VOICE_RETRY_MS mientras siga habiendo gente
+// esperando y no se haya logrado conectar. Se detiene solo si la sala se vacía
+// (ver stopWaitingMusic) o si la conexión finalmente se logra (ver arriba).
+function scheduleVoiceRetry(waitingChannel) {
+  if (voiceRetryTimer) return; // ya hay un reintento programado
+  voiceRetryTimer = setTimeout(async () => {
+    voiceRetryTimer = null;
+    if (!musicAvailable) return;
+    const freshChannel = await getChannel(waitingChannel.guild, config.waitingVoiceId).catch(() => null);
+    if (!freshChannel || humansIn(freshChannel) === 0) return; // ya no hay nadie, no reintentar
+    console.log('Reintentando conexión de voz al canal de espera...');
+    await startWaitingMusic(freshChannel);
+  }, VOICE_RETRY_MS);
+}
+
 function stopWaitingMusic(guildId) {
+  clearVoiceRetry();
   const connection = getVoiceConnection(guildId);
   if (audioPlayer) audioPlayer.stop(true);
   if (connection) connection.destroy();
