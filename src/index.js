@@ -172,7 +172,7 @@ async function startWaitingMusic(waitingChannel) {
     });
 
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
     } catch (error) {
       console.error('No pude conectarme al canal de espera:', error.message);
       connection.destroy();
