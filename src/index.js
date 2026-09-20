@@ -76,7 +76,7 @@ const config = {
   musicEnabled: bool(process.env.WAITING_MUSIC_ENABLED),
   musicPath: process.env.WAITING_MUSIC_PATH || path.join(__dirname, '..', 'musica_espera.mp3'),
   musicVolume: Math.min(Math.max(Number(process.env.WAITING_MUSIC_VOLUME || 0.25), 0), 1),
-  musicSelfDeaf: bool(process.env.WAITING_MUSIC_SELF_DEAF),
+  musicSelfDeaf: bool(process.env.WAITING_MUSIC_SELF_DEAF, 'false'),
 };
 
 const client = new Client({
@@ -101,8 +101,7 @@ const EPHEMERAL = { flags: MessageFlags.Ephemeral };
 
 let audioPlayer = null;
 let musicAvailable = config.musicEnabled;
-let voiceRetryTimer = null;
-const VOICE_RETRY_MS = 15000;
+let connectingGuildId = null; // evita joins duplicados mientras uno está en curso
 
 function buildResource() {
   const resource = createAudioResource(fs.createReadStream(config.musicPath), {
@@ -143,6 +142,16 @@ function humansIn(channel) {
   return channel.members.filter((m) => !m.user.bot).size;
 }
 
+// Empieza (o retoma) la reproducción en cuanto la conexión llega a Ready.
+// Se registra una sola vez por conexión mediante el listener de abajo.
+function startPlaybackWhenReady(connection) {
+  const player = getPlayer();
+  connection.subscribe(player);
+  if (player.state.status !== AudioPlayerStatus.Playing) {
+    player.play(buildResource());
+  }
+}
+
 async function startWaitingMusic(waitingChannel) {
   if (!musicAvailable) return;
 
@@ -152,71 +161,76 @@ async function startWaitingMusic(waitingChannel) {
     return;
   }
 
-  let connection = getVoiceConnection(waitingChannel.guild.id);
-  if (!connection) {
-    connection = joinVoiceChannel({
-      channelId: waitingChannel.id,
-      guildId: waitingChannel.guild.id,
-      adapterCreator: waitingChannel.guild.voiceAdapterCreator,
-      selfDeaf: config.musicSelfDeaf,
-      selfMute: false,
-    });
+  const guildId = waitingChannel.guild.id;
+  let connection = getVoiceConnection(guildId);
 
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5000),
-        ]);
-      } catch {
+  // Ya hay una conexión (conectada, o intentando conectar) para este servidor.
+  // No creamos una segunda ni la destruimos: dejamos que siga su curso.
+  if (connection) {
+    if (connection.state.status === VoiceConnectionStatus.Ready) {
+      startPlaybackWhenReady(connection);
+    }
+    return;
+  }
+
+  if (connectingGuildId === guildId) return; // ya hay un join en curso
+  connectingGuildId = guildId;
+
+  connection = joinVoiceChannel({
+    channelId: waitingChannel.id,
+    guildId,
+    adapterCreator: waitingChannel.guild.voiceAdapterCreator,
+    selfDeaf: config.musicSelfDeaf,
+    selfMute: false,
+  });
+
+  // En cuanto la conexión esté lista (aunque tarde, aunque sea en un
+  // reintento interno de discord.js), arrancamos la música automáticamente.
+  connection.on(VoiceConnectionStatus.Ready, () => {
+    console.log('Conexión de voz lista, iniciando música de espera.');
+    startPlaybackWhenReady(connection);
+  });
+
+  // Si se cae, dejamos que discord.js intente reconectar solo (Signalling/
+  // Connecting). Solo destruimos si la sala de espera ya está vacía —
+  // nunca solo por haber fallado un intento, para no salir y entrar
+  // mientras siga habiendo gente.
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+      // Discord.js sigue reintentando por su cuenta; no hacemos nada más.
+    } catch {
+      const stillWaiting = await getChannel(waitingChannel.guild, config.waitingVoiceId)
+        .then((ch) => ch && humansIn(ch) > 0)
+        .catch(() => false);
+      if (!stillWaiting) {
         connection.destroy();
       }
-    });
-
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
-    } catch (error) {
-      console.error('No pude conectarme al canal de espera:', error.message);
-      connection.destroy();
-      scheduleVoiceRetry(waitingChannel);
-      return;
+      // Si sigue habiendo gente, dejamos la conexión tal cual: discord.js
+      // seguirá intentando reconectar en segundo plano por su cuenta.
     }
-  }
+  });
 
-  clearVoiceRetry();
+  connection.on('error', (error) => {
+    console.error('Error en la conexión de voz (se mantiene, no se destruye):', error.message);
+  });
 
-  const player = getPlayer();
-  connection.subscribe(player);
-
-  if (player.state.status !== AudioPlayerStatus.Playing) {
-    player.play(buildResource());
-  }
-}
-
-function clearVoiceRetry() {
-  if (voiceRetryTimer) {
-    clearTimeout(voiceRetryTimer);
-    voiceRetryTimer = null;
-  }
-}
-
-// Reintenta la conexión de voz cada VOICE_RETRY_MS mientras siga habiendo gente
-// esperando y no se haya logrado conectar. Se detiene solo si la sala se vacía
-// (ver stopWaitingMusic) o si la conexión finalmente se logra (ver arriba).
-function scheduleVoiceRetry(waitingChannel) {
-  if (voiceRetryTimer) return; // ya hay un reintento programado
-  voiceRetryTimer = setTimeout(async () => {
-    voiceRetryTimer = null;
-    if (!musicAvailable) return;
-    const freshChannel = await getChannel(waitingChannel.guild, config.waitingVoiceId).catch(() => null);
-    if (!freshChannel || humansIn(freshChannel) === 0) return; // ya no hay nadie, no reintentar
-    console.log('Reintentando conexión de voz al canal de espera...');
-    await startWaitingMusic(freshChannel);
-  }, VOICE_RETRY_MS);
+  // Damos un primer margen de 30s para el log informativo, pero SIN destruir
+  // la conexión si falla: se queda intentando en segundo plano y el listener
+  // de arriba arrancará la música en cuanto (si) llegue a Ready.
+  entersState(connection, VoiceConnectionStatus.Ready, 30000)
+    .then(() => { connectingGuildId = null; })
+    .catch((error) => {
+      connectingGuildId = null;
+      console.error('La conexión de voz sigue intentando en segundo plano:', error.message);
+    });
 }
 
 function stopWaitingMusic(guildId) {
-  clearVoiceRetry();
+  connectingGuildId = null;
   const connection = getVoiceConnection(guildId);
   if (audioPlayer) audioPlayer.stop(true);
   if (connection) connection.destroy();
